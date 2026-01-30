@@ -9,7 +9,7 @@ from functools import partial
 import numpy as np
 import torch
 import tqdm
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForSeq2Seq, HfArgumentParser
 
@@ -28,7 +28,7 @@ class MainArguments:
         metadata={"help": "Modelo a ser usado"}
     )
     batch_size: int = field(
-        default=4,  # Reduzido por segurança de memória com CoT
+        default=4,
         metadata={"help": "Tamanho do batch de inferência"}
     )
     output_fname: str = field(
@@ -37,7 +37,11 @@ class MainArguments:
     )
     max_samples: int = field(
         default=-1,
-        metadata={"help": "Limita o número de amostras para teste rápido. Use -1 para rodar tudo."}
+        metadata={"help": "Limita o número de amostras. Use -1 para rodar tudo."}
+    )
+    user_prompt: str = field(
+        default=None,
+        metadata={"help": "Digite uma pergunta para testar apenas ela, ignorando o dataset."}
     )
 
 
@@ -60,36 +64,33 @@ def main():
     # Inicializa a tarefa e o tokenizer
     task = GSMTask(encode_format=decoding_args.encode_format)
     
-    # Adicione use_fast=False se tiver problemas com protobuf/versões antigas
     tokenizer = AutoTokenizer.from_pretrained(main_args.model_name_or_path, padding_side='left')
     tokenizer.pad_token_id = tokenizer.eos_token_id
     
-    # Carrega o modelo (com suporte a 4-bit se bitsandbytes estiver instalado, ou padrão bfloat16)
-    try:
-        from transformers import BitsAndBytesConfig
-        quantization_config = BitsAndBytesConfig(load_in_4bit=True)
-        print("Carregando modelo em 4-bit...")
-        model = AutoModelForCausalLM.from_pretrained(
-            main_args.model_name_or_path, 
-            quantization_config=quantization_config,
-            device_map='auto'
-        )
-    except ImportError:
-        print("BitsAndBytes não encontrado, carregando em bfloat16...")
-        model = AutoModelForCausalLM.from_pretrained(
-            main_args.model_name_or_path, 
-            torch_dtype=torch.bfloat16, 
-            device_map='auto'
-        )
+    # --- VOLTA AO ORIGINAL: Carregamento em bfloat16 (Sem 4-bit) ---
+    print(f"Carregando modelo {main_args.model_name_or_path} em bfloat16 (Original)...")
+    model = AutoModelForCausalLM.from_pretrained(
+        main_args.model_name_or_path, 
+        torch_dtype=torch.bfloat16, 
+        device_map='auto'
+    )
+    # ---------------------------------------------------------------
 
-    # Carrega dataset
-    raw_dataset = load_dataset("json", data_files={'test': main_args.data_file})['test']
-    
-    # Filtro opcional para testes rápidos
-    if main_args.max_samples > 0:
-        raw_dataset = raw_dataset.select(range(main_args.max_samples))
-        print(f"DEBUG: Dataset limitado a {main_args.max_samples} amostras.")
+    # --- LÓGICA DE CARREGAMENTO DO DATASET ---
+    if main_args.user_prompt:
+        print(f"\n[MODO PROMPT ÚNICO] Pergunta: {main_args.user_prompt}\n")
+        raw_dataset = Dataset.from_list([
+            {'question': main_args.user_prompt, 'answer': '#### 0'}
+        ])
+    else:
+        print(f"Carregando dataset do arquivo: {main_args.data_file}")
+        raw_dataset = load_dataset("json", data_files={'test': main_args.data_file})['test']
+        
+        if main_args.max_samples > 0:
+            raw_dataset = raw_dataset.select(range(main_args.max_samples))
+            print(f"DEBUG: Dataset limitado a {main_args.max_samples} amostras.")
 
+    # Tokenização
     encode_function_partial = partial(
         encode_function,
         tokenizer=tokenizer,
@@ -110,7 +111,10 @@ def main():
         collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding="longest"),
     )
 
-    # Listas para armazenar os datasets ricos
+    # --- LISTAS PARA O LOG ORIGINAL E OS NOVOS ---
+    outputs_all = [] # Lista para o log original "sujo"
+    accs_all = []
+    
     dataset_greedy = []
     dataset_max = []
     dataset_agg = []
@@ -123,29 +127,44 @@ def main():
     
     # --- LOOP DE GERAÇÃO ---
     for batch in pbar:
-        # Chama a função solve (que deve estar atualizada no solve.py)
         outputs = solve(model, tokenizer, task, batch, args=decoding_args)
         
         current_batch_size = len(outputs)
         
+        # Loop dentro do batch
         for i, output in enumerate(outputs):
             idx_global = total_samples + i
             gt_example = raw_dataset[idx_global]
             question_text = gt_example['question']
             
-            # ID Único para a chave (formato aninhado)
+            # --- LÓGICA ORIGINAL RESTAURADA ---
+            # Verifica corretude baseado no método principal (definido no solve.py)
+            output['is_correct'] = task.is_correct(gt_example, output['answer'])
+            outputs_all.append(output) # Adiciona ao log mestre
+            accs_all.append(output['is_correct'])
+            # ----------------------------------
+
             sample_id = f"sample_{idx_global}"
             
-            # Verifica corretude (apenas para métricas e metadados)
+            # Métricas específicas para os datasets separados
             is_greedy_correct = task.is_correct(gt_example, output.get('answer_greedy', ''))
             is_max_correct    = task.is_correct(gt_example, output.get('answer_max_path', ''))
             is_agg_correct    = task.is_correct(gt_example, output.get('answer_aggregated', ''))
             
             if is_agg_correct: correct_agg += 1
 
-            # Função para construir o objeto Rico Aninhado
+            # Print interativo
+            if main_args.user_prompt:
+                print("\n" + "="*40)
+                print(f"PERGUNTA: {question_text}")
+                print(f"Greedy:   {output.get('answer_greedy')} (Texto: {output.get('text_greedy')})")
+                print(f"Max Path: {output.get('answer_max_path')} (Score: {output.get('score_max_path'):.2f})")
+                print(f"Agregado: {output.get('answer_aggregated')} (Scores: {output.get('answer_scores')})")
+                print(f"Melhor Raciocínio:\n{output.get('text_aggregated')}")
+                print("="*40 + "\n")
+
+            # Função Helper para Datasets Ricos
             def create_rich_entry(method_suffix, is_correct):
-                # Determina chaves baseadas no método
                 if method_suffix == 'greedy':
                     ans = output.get('answer_greedy')
                     txt = output.get('text_greedy')
@@ -159,10 +178,9 @@ def main():
                 else: # aggregated
                     ans = output.get('answer_aggregated')
                     txt = output.get('text_aggregated')
-                    score = output.get('score_aggregated') # Score do representante
+                    score = output.get('score_aggregated')
                     span = output.get('span_aggregated')
 
-                # O objeto de valor (Value Object)
                 rich_info = {
                     "question": question_text,
                     "generated_answer": ans,
@@ -171,50 +189,60 @@ def main():
                     "score": score,
                     "is_correct": is_correct,
                     "method": method_suffix,
-                    # Adiciona campo conversations se quiser manter compatibilidade futura com chat templates
                     "conversations": [
                         {"role": "user", "content": question_text},
                         {"role": "assistant", "content": txt}
                     ],
-                    # Informações extras de debug
                     "candidates_count": len(output.get('candidates', [])),
                     "vote_scores": output.get('answer_scores') if method_suffix == 'aggregated' else None
                 }
-                
-                # Retorna formato aninhado: { "sample_0": { ... } }
                 return {sample_id: rich_info}
 
-            # Adiciona aos datasets correspondentes
             dataset_greedy.append(create_rich_entry('greedy', is_greedy_correct))
             dataset_max.append(create_rich_entry('max', is_max_correct))
             dataset_agg.append(create_rich_entry('aggregated', is_agg_correct))
 
         total_samples += current_batch_size
         
-        # Atualiza barra de progresso com acurácia atual do método agregado
-        if total_samples > 0:
-            pbar.set_postfix(acc_agg=f"{correct_agg / total_samples:.2%}")
+        if total_samples > 0 and not main_args.user_prompt:
+            pbar.set_postfix(acc=np.mean(accs_all)) # Mostra acurácia média geral
 
     # --- SALVAMENTO ---
-    base_fname = os.path.splitext(main_args.output_fname)[0]
     
+    # 1. Salva o Log Mestre Original (outputs_all)
+    if not main_args.user_prompt:
+        print(f"Acc Final = {np.mean(accs_all) * 100:.2f}")
+        
+        # Lógica de overwrite original
+        output_fname = main_args.output_fname
+        if os.path.exists(output_fname):
+            print(f"Aviso: Sobrescrevendo {output_fname}...")
+            
+        print(f"Salvando Log Original em {output_fname}...")
+        with open(output_fname, "w") as f:
+            for output in outputs_all:
+                f.write(json.dumps(output) + '\n')
+
+    # 2. Salva os Datasets Ricos Separados
+    base_fname = os.path.splitext(main_args.output_fname)[0]
     files_to_save = [
         (f"{base_fname}_greedy_rich.jsonl", dataset_greedy),
         (f"{base_fname}_max_rich.jsonl", dataset_max),
         (f"{base_fname}_aggregated_rich.jsonl", dataset_agg)
     ]
 
-    print("\n" + "="*40)
-    print("Processamento concluído.")
+    if not main_args.user_prompt:
+        print("\nSalvando Datasets Separados...")
+        
     for fname, dataset in files_to_save:
-        print(f"Salvando {len(dataset)} entradas ricas em {fname}...")
-        
         os.makedirs(os.path.dirname(fname) if os.path.dirname(fname) else '.', exist_ok=True)
-        
         with open(fname, "w") as f:
             for entry in dataset:
                 f.write(json.dumps(entry) + '\n')
-    print("="*40 + "\n")
+                
+    if not main_args.user_prompt:
+        print("Todos os arquivos salvos.")
+        print("="*40 + "\n")
 
 
 if __name__ == "__main__":
